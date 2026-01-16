@@ -4,5 +4,35 @@ LLM based chatbot with context based on DGR podcast.
 
 
 
-This repo contains the code used to generate a RAG based LLM chatbot, which uses audio to text to use information from the DGR podcast to improve the utility and credibility of responses. 
+This repo contains the code used to generate a RAG based LLM chatbot, which uses audio to text to use information from the DGR podcast to improve the utility and credibility of responses.
+
+
+
+Pipeline:
+
+1\) Fetch playlist metadata -> data/episode\_index.csv
+
+2\) Download YouTube transcripts -> data/raw/transcripts/
+
+
+
+\## Setup (Windows PowerShell)
+
+python -m venv .venv
+
+. .\\.venv\\Scripts\\Activate.ps1
+
+pip install -r requirements.txt
+
+
+
+Copy .env.example to .env and set PLAYLIST\_URL.
+
+
+
+\## Run
+
+python scripts/01\_fetch\_playlist\_index.py
+
+python scripts/02\_download\_transcripts.py
 

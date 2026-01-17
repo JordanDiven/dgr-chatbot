@@ -27,12 +27,10 @@ def main() -> None:
             sleep_s=0.6,
             overwrite=False,
         )
-
-        if not result.ok:
-            print(result.message)   # <-- add this line
-
-        ok += int(result.ok)
-        fail += int(not result.ok)
+        if result.ok:
+            ok += 1
+        else:
+            fail += 1
 
     print(f"Done. OK={ok}, FAIL={fail}, TOTAL={len(episodes)}")
 

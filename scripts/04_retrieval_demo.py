@@ -46,6 +46,7 @@ def main():
     ids = [c["chunk_id"] for c in chunks]
     docs = [c["text"] for c in chunks]
     metas = [{
+        "chunk_profile": c.get("chunk_profile", ""),
         "episode_id": c.get("episode_id", ""),
         "title": c.get("title", ""),
         "video_id": c.get("video_id", ""),

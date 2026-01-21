@@ -1,0 +1,71 @@
+Design Decisions (dgr-chatbot)
+==============================
+
+Purpose
+- Build a rehab coaching chatbot grounded in David Grey Rehab (DGR) philosophy.
+- Use RAG for grounding, but default to principles/summaries instead of transcript quotes.
+
+Data Sources and Formats
+- Source data: YouTube transcripts saved as plain text in data/raw/transcripts/*.txt.
+- Transcript format:
+  - Metadata header lines starting with "# key: value"
+  - Blank line
+  - Timestamped lines: "[start --> end] text"
+
+Chunking Strategy
+- Primary chunking profile is "guidance" to favor coherent, quote-light blocks.
+- Secondary "quotes" profile is available for source/quote-heavy workflows.
+- Chunking implemented in src/dgr_rag/utils/transcripts.py and used by scripts/03_make_chunks.py.
+
+Principles-First RAG
+- Instead of indexing raw transcript chunks, extract rehab principles per episode.
+- Output: data/processed/principles.jsonl (one record per principle with episode metadata).
+- Principle text is short, generalizable, and does not quote transcripts.
+
+Canon (Fallback Principles)
+- A condensed, cross-episode canon is built for coverage gaps.
+- Output: data/processed/canon.jsonl.
+- Used when episode-specific principles are weak or missing.
+
+Local LLM Choice
+- Principle extraction uses a local Ollama model (default llama3.1:8b).
+- Rationale: free, offline, repeatable.
+
+Retrieval and Embeddings
+- Vector store: Chroma (local persistent).
+- Embeddings: sentence-transformers (all-MiniLM-L6-v2).
+- Principles-only demo: scripts/06_retrieval_principles_demo.py
+  - Retrieves episode principles and canon.
+  - Injects them into the LLM prompt as the only knowledge source.
+  - Avoids transcript quotes unless explicitly requested.
+
+Answer Policy
+- Focus only on physio rehab advice.
+- If question is not rehab-related, redirect and ask to reframe.
+- If no episode-specific coverage, say so and use canon principles.
+- Avoid diagnosis; provide general guidance and encourage professional evaluation.
+
+Conversation Context Strategy (Planned)
+- Use short-term context: include last N turns (6-12) in each prompt.
+- Maintain a rolling summary of the rehab plan, symptoms, and constraints.
+- Persist structured state (JSON) for baseline, goals, phase, exercises, and recent feedback.
+- Use long-term memory via embeddings to retrieve relevant past sessions.
+
+Intake/Triage and Structured Retrieval (Planned)
+- Perform non-diagnostic intake: extract location, symptom type, irritability, and likely structures (hypotheses only).
+- Use structured output to drive retrieval (query expansion + tag filtering).
+- Generate rehab guidance from retrieved principles + canon; note when episode coverage is weak or missing.
+- Example structured output:
+  - body_region: posterior heel / distal calf
+  - likely_structure: achilles (hypothesis)
+  - symptom: soreness
+  - phase: unknown
+- Planned additions:
+  - Query-rewriter step that outputs structured tags (no diagnosis).
+  - Retrieval filtering using those tags plus a higher similarity threshold.
+  - Coverage note when the corpus doesn't mention the issue.
+
+Operational Notes
+- scripts/05_build_principles.py supports resume, retries, and timeouts to handle slow LLM calls.
+- Progress can be slow because each chunk triggers an LLM call.
+- Canon can be rebuilt from existing principles without re-extracting (see script flags).

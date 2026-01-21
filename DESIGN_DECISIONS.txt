@@ -5,6 +5,39 @@ Purpose
 - Build a rehab coaching chatbot grounded in David Grey Rehab (DGR) philosophy.
 - Use RAG for grounding, but default to principles/summaries instead of transcript quotes.
 
+Target Users and Risk Tolerance (Planned)
+- Primary users: general population who cannot afford or won't access physio.
+- Scope is daily-life and sports-related injuries, not major trauma.
+- Refuse or redirect for medical problems and serious conditions.
+
+Intake Depth and Structure (Planned)
+- Use a structured intake questionnaire to gather the details needed for rehab planning.
+- Collect symptoms, irritability, movement aggravators, and functional limits.
+
+Rehab Program Structure (Planned)
+- Time structure adapts to injury type and symptom response (not fixed weeks).
+- Progression and deload decisions use literature-informed rules with LLM guidance.
+- Output is a day-by-day schedule with exercises and progressions.
+- If the plan is tracking well, share the upcoming week's schedule in advance.
+
+Feedback and Accountability (Planned)
+- Daily check-ins to improve adherence and capture symptom changes.
+- Progress/regress decisions driven by user feedback plus evidence-based rules.
+
+Memory Retention (Planned)
+- Persist initial questionnaire answers.
+- Retain and summarize progress over the past ~8 weeks.
+
+Safety Copy (Planned)
+- Use safety disclaimers selectively, not in every response.
+
+Retrieval Usage (Planned)
+- Use principles (episode + canon) to guide rehab prescription, not to diagnose.
+- Keep plans structured and update primarily based on user feedback.
+
+Personalization (Planned)
+- Store user context (age, sport, goals, training history) to tailor tone and guidance.
+
 Data Sources and Formats
 - Source data: YouTube transcripts saved as plain text in data/raw/transcripts/*.txt.
 - Transcript format:
@@ -38,6 +71,13 @@ Retrieval and Embeddings
   - Retrieves episode principles and canon.
   - Injects them into the LLM prompt as the only knowledge source.
   - Avoids transcript quotes unless explicitly requested.
+- Rehab coach CLI prototype: scripts/07_rehab_coach_cli.py
+  - Intake questionnaire, daily check-ins, and session state persisted under data/sessions.
+  - Non-diagnostic triage extracts structured tags for retrieval.
+  - Day-by-day plan output with progression rules and selective safety notes.
+- Streamlit prototype: app.py
+  - UI for intake, daily check-ins, and chat history.
+  - Reuses principles-first retrieval and triage logic.
 
 Answer Policy
 - Focus only on physio rehab advice.

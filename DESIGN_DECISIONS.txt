@@ -43,6 +43,7 @@ Retrieval Usage (Planned)
 
 Personalization (Planned)
 - Store user context (age, sport, goals, training history) to tailor tone and guidance.
+- Scale program complexity based on activity level and training familiarity.
 
 Prototype and Deployment (Planned)
 - Build the mobile prototype after the Streamlit app is stable.

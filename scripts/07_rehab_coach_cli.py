@@ -15,43 +15,11 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 from dgr_rag.config import get_paths
+from dgr_rag.prompts import CHECKIN_PROMPT, PRESCRIPTION_PROMPT, SUMMARY_PROMPT, TRIAGE_PROMPT
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "llama3.1:8b"
-
-SYSTEM_PROMPT = (
-    "You are a rehab coaching assistant grounded in David Grey Rehab principles.\n"
-    "Use only the provided principles as your knowledge source.\n"
-    "Do not diagnose. Do not quote transcripts.\n"
-    "If the question is not about physio rehab, redirect and ask the user to reframe.\n"
-    "If episode-specific principles are weak or missing, say so and use the canon principles.\n"
-    "Avoid medical advice for serious conditions; include a brief safety note only when needed.\n"
-    "Output format:\n"
-    "1) Short answer\n"
-    "2) 7-day plan (day-by-day)\n"
-    "3) Progression rules\n"
-    "4) Check-in questions\n"
-    "5) Notes (include safety note only if needed)\n"
-)
-
-TRIAGE_PROMPT = (
-    "You are doing non-diagnostic triage for a rehab coach.\n"
-    "Return JSON only with keys:\n"
-    "body_region, likely_structure, symptom, irritability, phase, needs_medical, red_flags, tags, query_expansion.\n"
-    "Rules:\n"
-    "- Do not diagnose.\n"
-    "- likely_structure is a hypothesis only.\n"
-    "- irritability: low, medium, high, or unknown.\n"
-    "- phase: acute, subacute, chronic, or unknown.\n"
-    "- needs_medical is true if red flags or serious medical issues are present.\n"
-    "- tags should be 3-8 lower-case keywords.\n"
-)
-
-SUMMARY_PROMPT = (
-    "Summarize the rehab state for continuity.\n"
-    "Focus on symptoms, current plan, progress, constraints, and next steps.\n"
-    "Return a short paragraph. Avoid diagnosis and quotes.\n"
-)
+DEFAULT_PRIMARY_MODEL = "llama3.1:8b"
+DEFAULT_DAILY_MODEL = "phi3:mini"
 
 
 @dataclass
@@ -70,7 +38,7 @@ def call_ollama_chat(
     *,
     temperature: float = 0.2,
     num_predict: int = 700,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 600.0,
 ) -> str:
     payload = {
         "model": model,
@@ -121,6 +89,16 @@ def simple_tag_extract(text: str) -> List[str]:
     ]
     tags = [kw for kw in keywords if kw in text]
     return sorted(set(tags))
+
+
+def normalize_query_part(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if item)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
 
 
 def load_jsonl(path: Path) -> List[Dict]:
@@ -317,6 +295,9 @@ def triage(
             "symptom": "",
             "irritability": "unknown",
             "phase": "unknown",
+            "diagnosis": "",
+            "diagnosis_confidence": "low",
+            "rehabable": True,
             "needs_medical": False,
             "red_flags": [],
             "tags": tags,
@@ -324,6 +305,12 @@ def triage(
         }
     if not isinstance(data.get("tags"), list):
         data["tags"] = simple_tag_extract(user_text)
+    if not isinstance(data.get("diagnosis_confidence"), str):
+        data["diagnosis_confidence"] = "low"
+    if not isinstance(data.get("rehabable"), bool):
+        data["rehabable"] = True
+    if not isinstance(data.get("needs_medical"), bool):
+        data["needs_medical"] = False
     return data
 
 
@@ -348,6 +335,8 @@ def load_session(path: Path) -> Dict:
         "summary": "",
         "history": [],
         "checkins": [],
+        "plan_generated": False,
+        "phase": "intake",
         "turn_count": 0,
     }
 
@@ -359,7 +348,8 @@ def save_session(path: Path, state: Dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DGR rehab coach CLI (principles-first).")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--primary-model", default=DEFAULT_PRIMARY_MODEL)
+    parser.add_argument("--daily-model", default=DEFAULT_DAILY_MODEL)
     parser.add_argument("--user-id", default="default")
     parser.add_argument("--episode-k", type=int, default=6)
     parser.add_argument("--canon-k", type=int, default=4)
@@ -391,6 +381,10 @@ def main() -> None:
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_path = sessions_dir / f"{args.user_id}.json"
     state = load_session(session_path)
+    if not state.get("phase"):
+        state["phase"] = "prescription" if state.get("intake") else "intake"
+    if state.get("plan_generated") and state.get("phase") != "checkin":
+        state["phase"] = "checkin"
 
     if not state.get("intake"):
         state["intake"] = run_intake()
@@ -406,6 +400,8 @@ def main() -> None:
             break
         if user_text.lower() == ":intake":
             state["intake"] = run_intake()
+            state["phase"] = "prescription"
+            state["plan_generated"] = False
             save_session(session_path, state)
             continue
         if user_text.lower() == ":checkin":
@@ -417,47 +413,60 @@ def main() -> None:
             print(f"\nSummary:\n{state.get('summary', '')}\n")
             continue
 
-        triage_data = triage(args.model, user_text, state.get("intake", {}), state.get("summary", ""))
-        tags = triage_data.get("tags", [])
-        query_parts = [user_text, triage_data.get("query_expansion", "")]
-        query_text = " ".join(part for part in query_parts if part).strip()
-        if not query_text:
-            query_text = user_text
-
-        q_emb = embedder.encode([query_text], normalize_embeddings=True).tolist()[0]
-        ep_res = episode_collection.query(query_embeddings=[q_emb], n_results=args.episode_k)
-        ep_items = collect_results(ep_res, episode_map)
-        ep_items = filter_by_tags(ep_items, tags)
-
-        canon_items: List[RetrievalItem] = []
-        if canon:
-            canon_res = canon_collection.query(query_embeddings=[q_emb], n_results=args.canon_k)
-            canon_items = collect_results(canon_res, canon_map)
-            canon_items = filter_by_tags(canon_items, tags)
-
-        episode_selected = [item for item in ep_items if item.similarity >= args.episode_min_sim]
-        coverage_note = ""
-        if not episode_selected:
-            episode_selected = ep_items[:2] if ep_items else []
-            coverage_note = (
-                "Episode-specific principles were weak or missing for this issue. "
-                "Using canon principles for general guidance."
+        triage_data = triage(args.primary_model, user_text, state.get("intake", {}), state.get("summary", ""))
+        if triage_data.get("needs_medical"):
+            response = (
+                "This may be a medical issue or a red-flag presentation. "
+                "I am not providing a rehab plan. Get assessed by a qualified clinician."
             )
+        else:
+            tags = triage_data.get("tags", [])
+            query_parts = [user_text, triage_data.get("query_expansion", "")]
+            query_text = " ".join(
+                normalize_query_part(part) for part in query_parts if part
+            ).strip()
+            if not query_text:
+                query_text = user_text
 
-        prog_signal = progression_signal(state.get("checkins", []))
-        prompt = (
-            f"User question: {user_text}\n\n"
-            f"Intake: {json.dumps(state.get('intake', {}), ensure_ascii=True)}\n\n"
-            f"Latest check-in: {json.dumps(state.get('checkins', [])[-1:], ensure_ascii=True)}\n\n"
-            f"Progression signal: {prog_signal}\n\n"
-            f"Triage: {json.dumps(triage_data, ensure_ascii=True)}\n\n"
-            + format_context(episode_selected, "Episode principles", max_items=args.episode_k)
-            + format_context(canon_items, "Canon principles", max_items=args.canon_k)
-        )
-        if coverage_note:
-            prompt += f"\nNote: {coverage_note}\n"
+            q_emb = embedder.encode([query_text], normalize_embeddings=True).tolist()[0]
+            ep_res = episode_collection.query(query_embeddings=[q_emb], n_results=args.episode_k)
+            ep_items = collect_results(ep_res, episode_map)
+            ep_items = filter_by_tags(ep_items, tags)
 
-        response = call_ollama_chat(args.model, SYSTEM_PROMPT, prompt)
+            canon_items: List[RetrievalItem] = []
+            if canon:
+                canon_res = canon_collection.query(query_embeddings=[q_emb], n_results=args.canon_k)
+                canon_items = collect_results(canon_res, canon_map)
+                canon_items = filter_by_tags(canon_items, tags)
+
+            episode_selected = [item for item in ep_items if item.similarity >= args.episode_min_sim]
+            coverage_note = ""
+            if not episode_selected:
+                episode_selected = ep_items[:2] if ep_items else []
+                coverage_note = (
+                    "Episode-specific principles were weak or missing for this issue. "
+                    "Using canon principles for general guidance."
+                )
+
+            prog_signal = progression_signal(state.get("checkins", []))
+            prompt = (
+                f"User question: {user_text}\n\n"
+                f"Intake: {json.dumps(state.get('intake', {}), ensure_ascii=True)}\n\n"
+                f"Latest check-in: {json.dumps(state.get('checkins', [])[-1:], ensure_ascii=True)}\n\n"
+                f"Progression signal: {prog_signal}\n\n"
+                f"Triage: {json.dumps(triage_data, ensure_ascii=True)}\n\n"
+                + format_context(episode_selected, "Episode principles", max_items=args.episode_k)
+                + format_context(canon_items, "Canon principles", max_items=args.canon_k)
+            )
+            if coverage_note:
+                prompt += f"\nNote: {coverage_note}\n"
+
+            system_prompt = PRESCRIPTION_PROMPT if state.get("phase") == "prescription" else CHECKIN_PROMPT
+            active_model = args.primary_model if state.get("phase") == "prescription" else args.daily_model
+            response = call_ollama_chat(active_model, system_prompt, prompt)
+            if state.get("phase") == "prescription":
+                state["plan_generated"] = True
+                state["phase"] = "checkin"
         print(f"\nCoach:\n{response}\n")
 
         state["history"].append({"role": "user", "content": user_text, "ts": time.time()})
@@ -465,7 +474,12 @@ def main() -> None:
         state["turn_count"] = int(state.get("turn_count", 0)) + 1
 
         if state["turn_count"] % max(args.summary_every, 1) == 0:
-            state["summary"] = update_summary(args.model, state.get("summary", ""), state.get("intake", {}), state["history"])
+            state["summary"] = update_summary(
+                args.primary_model,
+                state.get("summary", ""),
+                state.get("intake", {}),
+                state["history"],
+            )
 
         save_session(session_path, state)
 

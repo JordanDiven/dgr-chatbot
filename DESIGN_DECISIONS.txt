@@ -13,16 +13,22 @@ Target Users and Risk Tolerance (Planned)
 Intake Depth and Structure (Planned)
 - Use a structured intake questionnaire to gather the details needed for rehab planning.
 - Collect symptoms, irritability, movement aggravators, and functional limits.
+- After intake, ask 3-5 LLM-generated follow-up questions before plan generation.
+- Once follow-ups are complete, generate the initial plan automatically.
 
 Rehab Program Structure (Planned)
 - Time structure adapts to injury type and symptom response (not fixed weeks).
 - Progression and deload decisions use literature-informed rules with LLM guidance.
 - Output is a day-by-day schedule with exercises and progressions.
+- Early-stage plans keep the same core exercises across the week (no daily churn).
 - If the plan is tracking well, share the upcoming week's schedule in advance.
+- Philosophy: find a safe entry point that doesn't trigger symptoms, then apply progressive overload.
+- Initial prescription includes education: mechanism, why it happened, literature-backed facts, and rehab methods.
 
 Feedback and Accountability (Planned)
 - Daily check-ins to improve adherence and capture symptom changes.
 - Progress/regress decisions driven by user feedback plus evidence-based rules.
+- Every response ends with "Tell me tomorrow" and explicit metrics to report.
 
 Memory Retention (Planned)
 - Persist initial questionnaire answers.
@@ -38,12 +44,22 @@ Retrieval Usage (Planned)
 Personalization (Planned)
 - Store user context (age, sport, goals, training history) to tailor tone and guidance.
 
+Prototype and Deployment (Planned)
+- Build the mobile prototype after the Streamlit app is stable.
+- Initial demo will run on the developer's own machine (no external hosting).
+
 Data Sources and Formats
 - Source data: YouTube transcripts saved as plain text in data/raw/transcripts/*.txt.
 - Transcript format:
   - Metadata header lines starting with "# key: value"
   - Blank line
   - Timestamped lines: "[start --> end] text"
+
+Prompt Configuration
+- Centralized prompts live in src/dgr_rag/prompts.py for review and tuning.
+- Prompts cover intake triage, follow-up questions, summary, and plan generation.
+- Principle extraction and canon synthesis prompts are also centralized.
+- Conversation uses phase-specific prompts (prescription vs daily check-in).
 
 Chunking Strategy
 - Primary chunking profile is "guidance" to favor coherent, quote-light blocks.
@@ -63,6 +79,8 @@ Canon (Fallback Principles)
 Local LLM Choice
 - Principle extraction uses a local Ollama model (default llama3.1:8b).
 - Rationale: free, offline, repeatable.
+- Streamlit development uses a smaller local model (phi3:mini) to reduce latency.
+- Plan and diagnosis phases use the primary model; daily check-ins can use a faster model.
 
 Retrieval and Embeddings
 - Vector store: Chroma (local persistent).
@@ -83,7 +101,8 @@ Answer Policy
 - Focus only on physio rehab advice.
 - If question is not rehab-related, redirect and ask to reframe.
 - If no episode-specific coverage, say so and use canon principles.
-- Avoid diagnosis; provide general guidance and encourage professional evaluation.
+- Provide a working diagnosis only when confidence is high and rehabable; otherwise state uncertainty.
+- Tone is direct and firm; avoid hedging.
 
 Conversation Context Strategy (Planned)
 - Use short-term context: include last N turns (6-12) in each prompt.
@@ -92,9 +111,12 @@ Conversation Context Strategy (Planned)
 - Use long-term memory via embeddings to retrieve relevant past sessions.
 
 Intake/Triage and Structured Retrieval (Planned)
-- Perform non-diagnostic intake: extract location, symptom type, irritability, and likely structures (hypotheses only).
+- Perform intake aimed at a working diagnosis when confidence is high and rehabable.
+- Use follow-up questions and simple self-checks to improve diagnostic clarity.
+- Extract location, symptom type, irritability, and likely structures (hypotheses only).
 - Use structured output to drive retrieval (query expansion + tag filtering).
 - Generate rehab guidance from retrieved principles + canon; note when episode coverage is weak or missing.
+- Use a working diagnosis hypothesis even when confidence is low; test for 10-14 days before pivoting.
 - Example structured output:
   - body_region: posterior heel / distal calf
   - likely_structure: achilles (hypothesis)
@@ -109,3 +131,4 @@ Operational Notes
 - scripts/05_build_principles.py supports resume, retries, and timeouts to handle slow LLM calls.
 - Progress can be slow because each chunk triggers an LLM call.
 - Canon can be rebuilt from existing principles without re-extracting (see script flags).
+- Development uses longer LLM timeouts to avoid early failures.

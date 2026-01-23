@@ -11,6 +11,7 @@ from typing import Dict, List
 from tqdm import tqdm
 
 from dgr_rag.config import get_paths
+from dgr_rag.prompts import build_canon_prompt, build_principles_prompt
 from dgr_rag.utils.transcripts import build_chunks, parse_transcript_file
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -104,24 +105,6 @@ def normalize_key(text: str) -> str:
     return "".join(ch.lower() for ch in text if ch.isalnum() or ch.isspace()).strip()
 
 
-def build_prompt(chunk_text: str, max_items: int) -> str:
-    return (
-        "You are extracting rehab coaching principles from a podcast transcript chunk.\n"
-        "Return JSON only as a list of objects with keys: principle, rationale, tags.\n"
-        "Rules:\n"
-        "- No direct quotes.\n"
-        "- Make each principle generalizable and rehab focused.\n"
-        "- Each principle must be <= 25 words.\n"
-        "- Each rationale must be one sentence.\n"
-        "- tags must be 3-6 lower-case keywords.\n"
-        f"- Return at most {max_items} items.\n"
-        "- If there are no clear rehab principles, return [].\n"
-        "\n"
-        "Transcript chunk:\n"
-        f"{chunk_text}\n"
-    )
-
-
 def build_principles_for_episode(
     model: str,
     episode_meta: Dict[str, str],
@@ -138,7 +121,7 @@ def build_principles_for_episode(
     items: List[Dict] = []
     episode_id = episode_meta.get("episode_id", "")
     for ch in chunks:
-        prompt = build_prompt(ch["text"], max_items=max_items_per_chunk)
+        prompt = build_principles_prompt(ch["text"], max_items=max_items_per_chunk)
         raw = ""
         for attempt in range(retries + 1):
             try:
@@ -304,20 +287,7 @@ def synthesize_canon(
     retry_backoff: float,
     skip_on_error: bool,
 ) -> List[Dict]:
-    prompt = (
-        "You are condensing rehab coaching principles into a concise canon.\n"
-        "Return JSON only as a list of objects with keys: principle, rationale, tags.\n"
-        "Rules:\n"
-        "- No direct quotes.\n"
-        "- Each principle must be <= 25 words.\n"
-        "- Each rationale must be one sentence.\n"
-        "- tags must be 3-6 lower-case keywords.\n"
-        f"- Return at most {target_count} items.\n"
-        "\n"
-        "Principles to condense:\n"
-        + "\n".join(f"- {p}" for p in principles)
-        + "\n"
-    )
+    prompt = build_canon_prompt(principles, target_count=target_count)
     raw = ""
     for attempt in range(retries + 1):
         try:

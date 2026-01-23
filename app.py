@@ -15,43 +15,19 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 
 from dgr_rag.config import get_paths
+from dgr_rag.prompts import (
+    CHECKIN_PROMPT,
+    FOLLOWUP_PROMPT,
+    PRESCRIPTION_PROMPT,
+    SUMMARY_PROMPT,
+    TRIAGE_PROMPT,
+)
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "llama3.1:8b"
+DEFAULT_PRIMARY_MODEL = "llama3.1:8b"
+DEFAULT_DAILY_MODEL = "phi3:mini"
 
-SYSTEM_PROMPT = (
-    "You are a rehab coaching assistant grounded in David Grey Rehab principles.\n"
-    "Use only the provided principles as your knowledge source.\n"
-    "Do not diagnose. Do not quote transcripts.\n"
-    "If the question is not about physio rehab, redirect and ask the user to reframe.\n"
-    "If episode-specific principles are weak or missing, say so and use the canon principles.\n"
-    "Avoid medical advice for serious conditions; include a brief safety note only when needed.\n"
-    "Output format:\n"
-    "1) Short answer\n"
-    "2) 7-day plan (day-by-day)\n"
-    "3) Progression rules\n"
-    "4) Check-in questions\n"
-    "5) Notes (include safety note only if needed)\n"
-)
-
-TRIAGE_PROMPT = (
-    "You are doing non-diagnostic triage for a rehab coach.\n"
-    "Return JSON only with keys:\n"
-    "body_region, likely_structure, symptom, irritability, phase, needs_medical, red_flags, tags, query_expansion.\n"
-    "Rules:\n"
-    "- Do not diagnose.\n"
-    "- likely_structure is a hypothesis only.\n"
-    "- irritability: low, medium, high, or unknown.\n"
-    "- phase: acute, subacute, chronic, or unknown.\n"
-    "- needs_medical is true if red flags or serious medical issues are present.\n"
-    "- tags should be 3-8 lower-case keywords.\n"
-)
-
-SUMMARY_PROMPT = (
-    "Summarize the rehab state for continuity.\n"
-    "Focus on symptoms, current plan, progress, constraints, and next steps.\n"
-    "Return a short paragraph. Avoid diagnosis and quotes.\n"
-)
+ 
 
 
 @dataclass
@@ -70,7 +46,7 @@ def call_ollama_chat(
     *,
     temperature: float = 0.2,
     num_predict: int = 700,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 600.0,
 ) -> str:
     payload = {
         "model": model,
@@ -121,6 +97,16 @@ def simple_tag_extract(text: str) -> List[str]:
     ]
     tags = [kw for kw in keywords if kw in text]
     return sorted(set(tags))
+
+
+def normalize_query_part(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if item)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
 
 
 @st.cache_data(show_spinner=False)
@@ -278,6 +264,9 @@ def triage(
             "symptom": "",
             "irritability": "unknown",
             "phase": "unknown",
+            "diagnosis": "",
+            "diagnosis_confidence": "low",
+            "rehabable": True,
             "needs_medical": False,
             "red_flags": [],
             "tags": tags,
@@ -285,6 +274,12 @@ def triage(
         }
     if not isinstance(data.get("tags"), list):
         data["tags"] = simple_tag_extract(user_text)
+    if not isinstance(data.get("diagnosis_confidence"), str):
+        data["diagnosis_confidence"] = "low"
+    if not isinstance(data.get("rehabable"), bool):
+        data["rehabable"] = True
+    if not isinstance(data.get("needs_medical"), bool):
+        data["needs_medical"] = False
     return data
 
 
@@ -298,6 +293,25 @@ def update_summary(model: str, summary: str, intake: Dict, history: List[Dict]) 
     return call_ollama_chat(model, SUMMARY_PROMPT, prompt, num_predict=220)
 
 
+def generate_followup_questions(model: str, intake: Dict) -> List[str]:
+    prompt = f"Intake: {json.dumps(intake, ensure_ascii=True)}\n"
+    try:
+        raw = call_ollama_chat(model, FOLLOWUP_PROMPT, prompt, num_predict=160)
+    except Exception:
+        raw = ""
+    questions = [line.strip(" -\t") for line in raw.splitlines() if line.strip()]
+    questions = [q for q in questions if q.endswith("?") or len(q.split()) >= 3]
+    if questions:
+        return questions[:5]
+    return [
+        "When does it hurt most (activity, range, or time of day)?",
+        "What movements or loads make it worse right now?",
+        "What makes it feel better or more tolerable?",
+        "Do 10 single-leg calf raises on the sore side and rate pain 0-10.",
+        "What activities do you need to return to in the next 4-8 weeks?",
+    ]
+
+
 def load_session(path: Path) -> Dict:
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
@@ -309,6 +323,11 @@ def load_session(path: Path) -> Dict:
         "summary": "",
         "history": [],
         "checkins": [],
+        "followup_questions": [],
+        "followup_answers": {},
+        "followup_complete": False,
+        "plan_generated": False,
+        "phase": "intake",
         "turn_count": 0,
     }
 
@@ -316,6 +335,13 @@ def load_session(path: Path) -> Dict:
 def save_session(path: Path, state: Dict) -> None:
     state["updated_at"] = datetime.utcnow().isoformat()
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def rerun_app() -> None:
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
 
 def render_intake_form() -> Optional[Dict]:
@@ -381,11 +407,19 @@ def init_resources(principles_path: str, canon_path: str) -> Tuple[List[Dict], L
 def ensure_state(session_path: Path) -> Dict:
     if "state" not in st.session_state:
         st.session_state["state"] = load_session(session_path)
-    return st.session_state["state"]
+    state = st.session_state["state"]
+    if not state.get("phase"):
+        if state.get("followup_complete") and state.get("plan_generated"):
+            state["phase"] = "checkin"
+        elif state.get("followup_complete"):
+            state["phase"] = "prescription"
+        else:
+            state["phase"] = "intake"
+    return state
 
 
 def main() -> None:
-    st.set_page_config(page_title="DGR Rehab Coach", page_icon="🦵", layout="wide")
+    st.set_page_config(page_title="DGR Rehab Coach", page_icon="DGR", layout="wide")
     st.title("DGR Rehab Coach (Principles-First)")
 
     paths = get_paths()
@@ -395,7 +429,14 @@ def main() -> None:
     with st.sidebar:
         st.header("Settings")
         user_id = st.text_input("User ID", value=st.session_state.get("user_id", "default"))
-        model = st.text_input("Ollama model", value=st.session_state.get("model", DEFAULT_MODEL))
+        primary_model = st.text_input(
+            "Primary model (diagnosis + plan)",
+            value=st.session_state.get("primary_model", DEFAULT_PRIMARY_MODEL),
+        )
+        daily_model = st.text_input(
+            "Daily model (check-ins)",
+            value=st.session_state.get("daily_model", DEFAULT_DAILY_MODEL),
+        )
         summary_every = st.number_input("Summarize every N turns", min_value=1, max_value=10, value=3, step=1)
         episode_k = st.number_input("Episode top-k", min_value=1, max_value=12, value=6, step=1)
         canon_k = st.number_input("Canon top-k", min_value=1, max_value=12, value=4, step=1)
@@ -403,7 +444,8 @@ def main() -> None:
         force_rebuild = st.checkbox("Rebuild index", value=False)
 
     st.session_state["user_id"] = user_id
-    st.session_state["model"] = model
+    st.session_state["primary_model"] = primary_model
+    st.session_state["daily_model"] = daily_model
 
     if not principles_path.exists():
         st.error("principles.jsonl not found. Run scripts/05_build_principles.py first.")
@@ -453,21 +495,47 @@ def main() -> None:
             intake = render_intake_form()
             if intake:
                 state["intake"] = intake
+                state["followup_questions"] = generate_followup_questions(primary_model, intake)
+                state["followup_answers"] = {}
+                state["followup_complete"] = False
+                state["plan_generated"] = False
+                state["phase"] = "intake"
                 save_session(session_path, state)
-                st.experimental_rerun()
+                rerun_app()
         else:
             with st.expander("Intake", expanded=False):
                 st.json(state.get("intake", {}))
             if st.button("Update intake"):
                 state["intake"] = {}
+                state["followup_questions"] = []
+                state["followup_answers"] = {}
+                state["followup_complete"] = False
+                state["plan_generated"] = False
+                state["phase"] = "intake"
                 save_session(session_path, state)
-                st.experimental_rerun()
+                rerun_app()
 
-        checkin = render_checkin_form()
-        if checkin:
-            state.setdefault("checkins", []).append(checkin)
-            save_session(session_path, state)
-            st.success("Check-in saved.")
+        if state.get("followup_questions") and not state.get("followup_complete"):
+            with st.form("followup_form"):
+                st.subheader("Follow-up questions")
+                answers = {}
+                for idx, question in enumerate(state["followup_questions"], start=1):
+                    key = f"followup_{idx}"
+                    answers[question] = st.text_input(question, key=key)
+                submitted = st.form_submit_button("Save follow-up answers")
+            if submitted:
+                state["followup_answers"] = answers
+                state["followup_complete"] = True
+                state["plan_generated"] = False
+                state["phase"] = "prescription"
+                save_session(session_path, state)
+                rerun_app()
+        else:
+            checkin = render_checkin_form()
+            if checkin:
+                state.setdefault("checkins", []).append(checkin)
+                save_session(session_path, state)
+                st.success("Check-in saved.")
 
     st.subheader("Coach Chat")
     for msg in state.get("history", []):
@@ -476,57 +544,88 @@ def main() -> None:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    prompt = st.chat_input("Ask a rehab question")
+    prompt = None
+    if state.get("followup_questions") and not state.get("followup_complete"):
+        st.info("Answer the follow-up questions to unlock the coach chat.")
+    else:
+        prompt = st.chat_input("Ask a rehab question")
+
+    auto_plan_ready = bool(state.get("followup_complete") and not state.get("plan_generated"))
+    if auto_plan_ready:
+        st.info("Generating your initial rehab plan from intake and follow-ups.")
+        prompt = "Generate my initial rehab plan based on my intake and follow-up answers."
+
     if prompt:
         with st.spinner("Thinking..."):
-            triage_data = triage(model, prompt, state.get("intake", {}), state.get("summary", ""))
+            triage_intake = dict(state.get("intake", {}))
+            if state.get("followup_answers"):
+                triage_intake["followup_answers"] = state["followup_answers"]
+            triage_data = triage(primary_model, prompt, triage_intake, state.get("summary", ""))
             state["last_triage"] = triage_data
-            tags = triage_data.get("tags", [])
-            query_parts = [prompt, triage_data.get("query_expansion", "")]
-            query_text = " ".join(part for part in query_parts if part).strip() or prompt
-
-            q_emb = embedder.encode([query_text], normalize_embeddings=True).tolist()[0]
-            ep_res = episode_collection.query(query_embeddings=[q_emb], n_results=int(episode_k))
-            ep_items = filter_by_tags(collect_results(ep_res, episode_map), tags)
-
-            canon_items: List[RetrievalItem] = []
-            if canon:
-                canon_res = canon_collection.query(query_embeddings=[q_emb], n_results=int(canon_k))
-                canon_items = filter_by_tags(collect_results(canon_res, canon_map), tags)
-
-            episode_selected = [item for item in ep_items if item.similarity >= float(episode_min_sim)]
-            coverage_note = ""
-            if not episode_selected:
-                episode_selected = ep_items[:2] if ep_items else []
-                coverage_note = (
-                    "Episode-specific principles were weak or missing for this issue. "
-                    "Using canon principles for general guidance."
+            if triage_data.get("needs_medical"):
+                response = (
+                    "This may be a medical issue or a red-flag presentation. "
+                    "I am not providing a rehab plan. Get assessed by a qualified clinician."
                 )
+            else:
+                tags = triage_data.get("tags", [])
+                query_parts = [prompt, triage_data.get("query_expansion", "")]
+                query_text = " ".join(
+                    normalize_query_part(part) for part in query_parts if part
+                ).strip() or prompt
 
-            prog_signal = progression_signal(state.get("checkins", []))
-            user_prompt = (
-                f"User question: {prompt}\n\n"
-                f"Intake: {json.dumps(state.get('intake', {}), ensure_ascii=True)}\n\n"
-                f"Latest check-in: {json.dumps(state.get('checkins', [])[-1:], ensure_ascii=True)}\n\n"
-                f"Progression signal: {prog_signal}\n\n"
-                f"Triage: {json.dumps(triage_data, ensure_ascii=True)}\n\n"
-                + format_context(episode_selected, "Episode principles", max_items=int(episode_k))
-                + format_context(canon_items, "Canon principles", max_items=int(canon_k))
-            )
-            if coverage_note:
-                user_prompt += f"\nNote: {coverage_note}\n"
+                q_emb = embedder.encode([query_text], normalize_embeddings=True).tolist()[0]
+                ep_res = episode_collection.query(query_embeddings=[q_emb], n_results=int(episode_k))
+                ep_items = filter_by_tags(collect_results(ep_res, episode_map), tags)
 
-            response = call_ollama_chat(model, SYSTEM_PROMPT, user_prompt)
+                canon_items: List[RetrievalItem] = []
+                if canon:
+                    canon_res = canon_collection.query(query_embeddings=[q_emb], n_results=int(canon_k))
+                    canon_items = filter_by_tags(collect_results(canon_res, canon_map), tags)
+
+                episode_selected = [item for item in ep_items if item.similarity >= float(episode_min_sim)]
+                coverage_note = ""
+                if not episode_selected:
+                    episode_selected = ep_items[:2] if ep_items else []
+                    coverage_note = (
+                        "Episode-specific principles were weak or missing for this issue. "
+                        "Using canon principles for general guidance."
+                    )
+
+                prog_signal = progression_signal(state.get("checkins", []))
+                user_prompt = (
+                    f"User question: {prompt}\n\n"
+                    f"Intake: {json.dumps(triage_intake, ensure_ascii=True)}\n\n"
+                    f"Latest check-in: {json.dumps(state.get('checkins', [])[-1:], ensure_ascii=True)}\n\n"
+                    f"Progression signal: {prog_signal}\n\n"
+                    f"Triage: {json.dumps(triage_data, ensure_ascii=True)}\n\n"
+                    + format_context(episode_selected, "Episode principles", max_items=int(episode_k))
+                    + format_context(canon_items, "Canon principles", max_items=int(canon_k))
+                )
+                if coverage_note:
+                    user_prompt += f"\nNote: {coverage_note}\n"
+
+                system_prompt = PRESCRIPTION_PROMPT if state.get("phase") == "prescription" else CHECKIN_PROMPT
+                active_model = primary_model if state.get("phase") == "prescription" else daily_model
+                response = call_ollama_chat(active_model, system_prompt, user_prompt)
 
         state["history"].append({"role": "user", "content": prompt, "ts": time.time()})
         state["history"].append({"role": "assistant", "content": response, "ts": time.time()})
         state["turn_count"] = int(state.get("turn_count", 0)) + 1
+        if auto_plan_ready:
+            state["plan_generated"] = True
+            state["phase"] = "checkin"
 
         if state["turn_count"] % int(summary_every) == 0:
-            state["summary"] = update_summary(model, state.get("summary", ""), state.get("intake", {}), state["history"])
+            state["summary"] = update_summary(
+                primary_model,
+                state.get("summary", ""),
+                state.get("intake", {}),
+                state["history"],
+            )
 
         save_session(session_path, state)
-        st.experimental_rerun()
+        rerun_app()
 
 
 if __name__ == "__main__":

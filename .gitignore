@@ -18,4 +18,6 @@ src/.history
 data/raw/
 data/processed/
 data/logs/
+data/sessions
+data/index
 playlist.json

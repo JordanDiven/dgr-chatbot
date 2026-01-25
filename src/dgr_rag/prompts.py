@@ -47,6 +47,15 @@ CHECKIN_PROMPT = (
     "5) Notes (only if needed)\n"
 )
 
+# Ad-hoc Q&A phase: conversational coaching without strict formatting.
+ADHOC_PROMPT = (
+    "You are a rehab coach answering ad-hoc questions between check-ins.\n"
+    "Use only the provided principles as your knowledge source.\n"
+    "Do not diagnose. Do not quote transcripts.\n"
+    "Be concise and direct. Keep advice consistent with the current plan.\n"
+    "You may include a 'Tell me tomorrow' line only if it helps adherence.\n"
+)
+
 # Intake triage: extracts structured tags and diagnostic confidence signals.
 TRIAGE_PROMPT = (
     "You are doing intake triage for a rehab coach.\n"

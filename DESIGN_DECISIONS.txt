@@ -29,6 +29,7 @@ Feedback and Accountability (Planned)
 - Daily check-ins to improve adherence and capture symptom changes.
 - Progress/regress decisions driven by user feedback plus evidence-based rules.
 - Every response ends with "Tell me tomorrow" and explicit metrics to report.
+- Daily check-in is required before ad-hoc chat for that day.
 
 Memory Retention (Planned)
 - Persist initial questionnaire answers.
@@ -61,6 +62,7 @@ Prompt Configuration
 - Prompts cover intake triage, follow-up questions, summary, and plan generation.
 - Principle extraction and canon synthesis prompts are also centralized.
 - Conversation uses phase-specific prompts (prescription vs daily check-in).
+- Streamlit dev mode can display retrieved context and the active prompt.
 
 Chunking Strategy
 - Primary chunking profile is "guidance" to favor coherent, quote-light blocks.
@@ -82,6 +84,7 @@ Local LLM Choice
 - Rationale: free, offline, repeatable.
 - Streamlit development uses a smaller local model (phi3:mini) to reduce latency.
 - Plan and diagnosis phases use the primary model; daily check-ins can use a faster model.
+- Primary provider can be cloud-based (OpenAI GPT-4o) when accuracy matters more than cost.
 
 Retrieval and Embeddings
 - Vector store: Chroma (local persistent).
@@ -133,3 +136,4 @@ Operational Notes
 - Progress can be slow because each chunk triggers an LLM call.
 - Canon can be rebuilt from existing principles without re-extracting (see script flags).
 - Development uses longer LLM timeouts to avoid early failures.
+- If Chroma index becomes incompatible, rebuild the index (toggle in Streamlit).

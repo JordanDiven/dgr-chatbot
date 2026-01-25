@@ -69,6 +69,11 @@ ollama pull llama3.1:8b
 ollama pull phi3:mini
 ```
 
+## OpenAI (optional)
+
+The prescription phase can use OpenAI GPT-4o. Set `OPENAI_API_KEY` in `.env`.
+The Streamlit app lets you choose the provider and model for primary and daily phases.
+
 ## Build data
 
 ```

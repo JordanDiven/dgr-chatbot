@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,10 +13,12 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 from dgr_rag.config import get_paths
+from dgr_rag.llm import call_chat
 from dgr_rag.prompts import CHECKIN_PROMPT, PRESCRIPTION_PROMPT, SUMMARY_PROMPT, TRIAGE_PROMPT
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_PRIMARY_MODEL = "llama3.1:8b"
+DEFAULT_PRIMARY_PROVIDER = "openai"
+DEFAULT_PRIMARY_MODEL = "gpt-4o-mini"
+DEFAULT_DAILY_PROVIDER = "ollama"
 DEFAULT_DAILY_MODEL = "phi3:mini"
 
 
@@ -29,40 +29,6 @@ class RetrievalItem:
     tags: List[str]
     similarity: float
     meta: Dict[str, str]
-
-
-def call_ollama_chat(
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    *,
-    temperature: float = 0.2,
-    num_predict: int = 700,
-    timeout_seconds: float = 600.0,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": num_predict,
-        },
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(OLLAMA_CHAT_URL, data=data, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.URLError as exc:
-        raise RuntimeError("Ollama request failed. Is the server running on localhost:11434?") from exc
-
-    obj = json.loads(body)
-    message = obj.get("message", {})
-    return str(message.get("content", "")).strip()
 
 
 def extract_json_object(raw: str) -> Dict:
@@ -275,6 +241,7 @@ def progression_signal(checkins: List[Dict]) -> str:
 
 
 def triage(
+    provider: str,
     model: str,
     user_text: str,
     intake: Dict,
@@ -285,7 +252,7 @@ def triage(
         f"Intake summary: {json.dumps(intake, ensure_ascii=True)}\n\n"
         f"Session summary: {summary}\n"
     )
-    raw = call_ollama_chat(model, TRIAGE_PROMPT, prompt, num_predict=300)
+    raw = call_chat(provider, model, TRIAGE_PROMPT, prompt, num_predict=300)
     data = extract_json_object(raw)
     if not data:
         tags = simple_tag_extract(user_text)
@@ -314,14 +281,14 @@ def triage(
     return data
 
 
-def update_summary(model: str, summary: str, intake: Dict, history: List[Dict]) -> str:
+def update_summary(provider: str, model: str, summary: str, intake: Dict, history: List[Dict]) -> str:
     recent = history[-8:]
     prompt = (
         f"Previous summary: {summary}\n\n"
         f"Intake: {json.dumps(intake, ensure_ascii=True)}\n\n"
         f"Recent conversation:\n{json.dumps(recent, ensure_ascii=True)}\n"
     )
-    return call_ollama_chat(model, SUMMARY_PROMPT, prompt, num_predict=220)
+    return call_chat(provider, model, SUMMARY_PROMPT, prompt, num_predict=220)
 
 
 def load_session(path: Path) -> Dict:
@@ -348,7 +315,9 @@ def save_session(path: Path, state: Dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DGR rehab coach CLI (principles-first).")
+    parser.add_argument("--primary-provider", default=DEFAULT_PRIMARY_PROVIDER)
     parser.add_argument("--primary-model", default=DEFAULT_PRIMARY_MODEL)
+    parser.add_argument("--daily-provider", default=DEFAULT_DAILY_PROVIDER)
     parser.add_argument("--daily-model", default=DEFAULT_DAILY_MODEL)
     parser.add_argument("--user-id", default="default")
     parser.add_argument("--episode-k", type=int, default=6)
@@ -413,7 +382,7 @@ def main() -> None:
             print(f"\nSummary:\n{state.get('summary', '')}\n")
             continue
 
-        triage_data = triage(args.primary_model, user_text, state.get("intake", {}), state.get("summary", ""))
+        triage_data = triage(args.primary_provider, args.primary_model, user_text, state.get("intake", {}), state.get("summary", ""))
         if triage_data.get("needs_medical"):
             response = (
                 "This may be a medical issue or a red-flag presentation. "
@@ -462,8 +431,13 @@ def main() -> None:
                 prompt += f"\nNote: {coverage_note}\n"
 
             system_prompt = PRESCRIPTION_PROMPT if state.get("phase") == "prescription" else CHECKIN_PROMPT
-            active_model = args.primary_model if state.get("phase") == "prescription" else args.daily_model
-            response = call_ollama_chat(active_model, system_prompt, prompt)
+            if state.get("phase") == "prescription":
+                active_provider = args.primary_provider
+                active_model = args.primary_model
+            else:
+                active_provider = args.daily_provider
+                active_model = args.daily_model
+            response = call_chat(active_provider, active_model, system_prompt, prompt)
             if state.get("phase") == "prescription":
                 state["plan_generated"] = True
                 state["phase"] = "checkin"
@@ -475,6 +449,7 @@ def main() -> None:
 
         if state["turn_count"] % max(args.summary_every, 1) == 0:
             state["summary"] = update_summary(
+                args.primary_provider,
                 args.primary_model,
                 state.get("summary", ""),
                 state.get("intake", {}),

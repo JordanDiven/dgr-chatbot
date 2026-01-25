@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-import urllib.error
-import urllib.request
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +14,9 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 
 from dgr_rag.config import get_paths
+from dgr_rag.llm import call_chat
 from dgr_rag.prompts import (
+    ADHOC_PROMPT,
     CHECKIN_PROMPT,
     FOLLOWUP_PROMPT,
     PRESCRIPTION_PROMPT,
@@ -23,8 +24,9 @@ from dgr_rag.prompts import (
     TRIAGE_PROMPT,
 )
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_PRIMARY_MODEL = "llama3.1:8b"
+DEFAULT_PRIMARY_PROVIDER = "openai"
+DEFAULT_PRIMARY_MODEL = "gpt-4o-mini"
+DEFAULT_DAILY_PROVIDER = "ollama"
 DEFAULT_DAILY_MODEL = "phi3:mini"
 
  
@@ -37,40 +39,6 @@ class RetrievalItem:
     tags: List[str]
     similarity: float
     meta: Dict[str, str]
-
-
-def call_ollama_chat(
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    *,
-    temperature: float = 0.2,
-    num_predict: int = 700,
-    timeout_seconds: float = 600.0,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": num_predict,
-        },
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(OLLAMA_CHAT_URL, data=data, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.URLError as exc:
-        raise RuntimeError("Ollama request failed. Is the server running on localhost:11434?") from exc
-
-    obj = json.loads(body)
-    message = obj.get("message", {})
-    return str(message.get("content", "")).strip()
 
 
 def extract_json_object(raw: str) -> Dict:
@@ -175,6 +143,27 @@ def ensure_collection(
     return collection, item_map
 
 
+def init_chroma_client(chroma_dir: Path, *, force_rebuild: bool) -> chromadb.PersistentClient:
+    try:
+        return chromadb.PersistentClient(
+            path=str(chroma_dir),
+            settings=Settings(anonymized_telemetry=False),
+        )
+    except ValueError as exc:
+        if "default_tenant" in str(exc):
+            if force_rebuild:
+                shutil.rmtree(chroma_dir, ignore_errors=True)
+                chroma_dir.mkdir(parents=True, exist_ok=True)
+                return chromadb.PersistentClient(
+                    path=str(chroma_dir),
+                    settings=Settings(anonymized_telemetry=False),
+                )
+            raise RuntimeError(
+                "Chroma index is incompatible. Enable 'Rebuild index' or delete data/index/chroma_coach."
+            ) from exc
+        raise
+
+
 def collect_results(res: Dict, item_map: Dict[str, Dict]) -> List[RetrievalItem]:
     results: List[RetrievalItem] = []
     ids = res.get("ids", [[]])[0]
@@ -243,7 +232,28 @@ def progression_signal(checkins: List[Dict]) -> str:
     return "maintain"
 
 
+def latest_checkin_date(checkins: List[Dict]) -> Optional[datetime.date]:
+    if not checkins:
+        return None
+    latest = checkins[-1]
+    ts = latest.get("timestamp", "")
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts).date()
+    except ValueError:
+        return None
+
+
+def checkin_done_today(checkins: List[Dict]) -> bool:
+    last_date = latest_checkin_date(checkins)
+    if not last_date:
+        return False
+    return last_date == datetime.now().date()
+
+
 def triage(
+    provider: str,
     model: str,
     user_text: str,
     intake: Dict,
@@ -254,7 +264,7 @@ def triage(
         f"Intake summary: {json.dumps(intake, ensure_ascii=True)}\n\n"
         f"Session summary: {summary}\n"
     )
-    raw = call_ollama_chat(model, TRIAGE_PROMPT, prompt, num_predict=300)
+    raw = call_chat(provider, model, TRIAGE_PROMPT, prompt, num_predict=300)
     data = extract_json_object(raw)
     if not data:
         tags = simple_tag_extract(user_text)
@@ -283,20 +293,20 @@ def triage(
     return data
 
 
-def update_summary(model: str, summary: str, intake: Dict, history: List[Dict]) -> str:
+def update_summary(provider: str, model: str, summary: str, intake: Dict, history: List[Dict]) -> str:
     recent = history[-8:]
     prompt = (
         f"Previous summary: {summary}\n\n"
         f"Intake: {json.dumps(intake, ensure_ascii=True)}\n\n"
         f"Recent conversation:\n{json.dumps(recent, ensure_ascii=True)}\n"
     )
-    return call_ollama_chat(model, SUMMARY_PROMPT, prompt, num_predict=220)
+    return call_chat(provider, model, SUMMARY_PROMPT, prompt, num_predict=220)
 
 
-def generate_followup_questions(model: str, intake: Dict) -> List[str]:
+def generate_followup_questions(provider: str, model: str, intake: Dict) -> List[str]:
     prompt = f"Intake: {json.dumps(intake, ensure_ascii=True)}\n"
     try:
-        raw = call_ollama_chat(model, FOLLOWUP_PROMPT, prompt, num_predict=160)
+        raw = call_chat(provider, model, FOLLOWUP_PROMPT, prompt, num_predict=160)
     except Exception:
         raw = ""
     questions = [line.strip(" -\t") for line in raw.splitlines() if line.strip()]
@@ -328,6 +338,8 @@ def load_session(path: Path) -> Dict:
         "followup_complete": False,
         "plan_generated": False,
         "phase": "intake",
+        "pending_prompt": "",
+        "pending_mode": "",
         "turn_count": 0,
     }
 
@@ -429,9 +441,19 @@ def main() -> None:
     with st.sidebar:
         st.header("Settings")
         user_id = st.text_input("User ID", value=st.session_state.get("user_id", "default"))
+        primary_provider = st.selectbox(
+            "Primary provider",
+            options=["openai", "ollama"],
+            index=0 if st.session_state.get("primary_provider", DEFAULT_PRIMARY_PROVIDER) == "openai" else 1,
+        )
         primary_model = st.text_input(
             "Primary model (diagnosis + plan)",
             value=st.session_state.get("primary_model", DEFAULT_PRIMARY_MODEL),
+        )
+        daily_provider = st.selectbox(
+            "Daily provider",
+            options=["ollama", "openai"],
+            index=0 if st.session_state.get("daily_provider", DEFAULT_DAILY_PROVIDER) == "ollama" else 1,
         )
         daily_model = st.text_input(
             "Daily model (check-ins)",
@@ -442,10 +464,13 @@ def main() -> None:
         canon_k = st.number_input("Canon top-k", min_value=1, max_value=12, value=4, step=1)
         episode_min_sim = st.slider("Episode min similarity", min_value=0.1, max_value=0.9, value=0.35, step=0.05)
         force_rebuild = st.checkbox("Rebuild index", value=False)
+        dev_mode = st.checkbox("Developer mode (show RAG + prompt)", value=False)
 
     st.session_state["user_id"] = user_id
     st.session_state["primary_model"] = primary_model
     st.session_state["daily_model"] = daily_model
+    st.session_state["primary_provider"] = primary_provider
+    st.session_state["daily_provider"] = daily_provider
 
     if not principles_path.exists():
         st.error("principles.jsonl not found. Run scripts/05_build_principles.py first.")
@@ -455,7 +480,11 @@ def main() -> None:
 
     chroma_dir = paths.data_dir / "index" / "chroma_coach"
     chroma_dir.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(chroma_dir), settings=Settings(anonymized_telemetry=False))
+    try:
+        client = init_chroma_client(chroma_dir, force_rebuild=force_rebuild)
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.stop()
 
     episode_collection, episode_map = ensure_collection(
         client,
@@ -495,7 +524,7 @@ def main() -> None:
             intake = render_intake_form()
             if intake:
                 state["intake"] = intake
-                state["followup_questions"] = generate_followup_questions(primary_model, intake)
+                state["followup_questions"] = generate_followup_questions(primary_provider, primary_model, intake)
                 state["followup_answers"] = {}
                 state["followup_complete"] = False
                 state["plan_generated"] = False
@@ -531,11 +560,24 @@ def main() -> None:
                 save_session(session_path, state)
                 rerun_app()
         else:
-            checkin = render_checkin_form()
-            if checkin:
-                state.setdefault("checkins", []).append(checkin)
-                save_session(session_path, state)
-                st.success("Check-in saved.")
+            checkin_required = state.get("phase") == "checkin" and not checkin_done_today(state.get("checkins", []))
+            if checkin_required:
+                st.info("Daily check-in required before continuing.")
+                checkin = render_checkin_form()
+                if checkin:
+                    state.setdefault("checkins", []).append(checkin)
+                    state["pending_prompt"] = (
+                        "Daily check-in completed. Provide today's focus and instructions."
+                    )
+                    state["pending_mode"] = "checkin"
+                    save_session(session_path, state)
+                    rerun_app()
+            else:
+                checkin = render_checkin_form()
+                if checkin:
+                    state.setdefault("checkins", []).append(checkin)
+                    save_session(session_path, state)
+                    st.success("Check-in saved.")
 
     st.subheader("Coach Chat")
     for msg in state.get("history", []):
@@ -545,22 +587,31 @@ def main() -> None:
             st.write(msg["content"])
 
     prompt = None
-    if state.get("followup_questions") and not state.get("followup_complete"):
+    mode = "adhoc"
+    if state.get("pending_prompt"):
+        prompt = state.get("pending_prompt")
+        mode = state.get("pending_mode") or "checkin"
+    elif state.get("followup_questions") and not state.get("followup_complete"):
         st.info("Answer the follow-up questions to unlock the coach chat.")
     else:
-        prompt = st.chat_input("Ask a rehab question")
+        checkin_required = state.get("phase") == "checkin" and not checkin_done_today(state.get("checkins", []))
+        if checkin_required:
+            st.info("Daily check-in required before continuing.")
+        else:
+            prompt = st.chat_input("Ask a rehab question")
 
     auto_plan_ready = bool(state.get("followup_complete") and not state.get("plan_generated"))
     if auto_plan_ready:
         st.info("Generating your initial rehab plan from intake and follow-ups.")
         prompt = "Generate my initial rehab plan based on my intake and follow-up answers."
+        mode = "prescription"
 
     if prompt:
         with st.spinner("Thinking..."):
             triage_intake = dict(state.get("intake", {}))
             if state.get("followup_answers"):
                 triage_intake["followup_answers"] = state["followup_answers"]
-            triage_data = triage(primary_model, prompt, triage_intake, state.get("summary", ""))
+            triage_data = triage(primary_provider, primary_model, prompt, triage_intake, state.get("summary", ""))
             state["last_triage"] = triage_data
             if triage_data.get("needs_medical"):
                 response = (
@@ -605,9 +656,29 @@ def main() -> None:
                 if coverage_note:
                     user_prompt += f"\nNote: {coverage_note}\n"
 
-                system_prompt = PRESCRIPTION_PROMPT if state.get("phase") == "prescription" else CHECKIN_PROMPT
-                active_model = primary_model if state.get("phase") == "prescription" else daily_model
-                response = call_ollama_chat(active_model, system_prompt, user_prompt)
+                if mode == "prescription" or state.get("phase") == "prescription":
+                    system_prompt = PRESCRIPTION_PROMPT
+                    active_model = primary_model
+                    active_provider = primary_provider
+                elif mode == "checkin":
+                    system_prompt = CHECKIN_PROMPT
+                    active_model = daily_model
+                    active_provider = daily_provider
+                else:
+                    system_prompt = ADHOC_PROMPT
+                    active_model = daily_model
+                    active_provider = daily_provider
+                if dev_mode:
+                    st.session_state["last_prompt"] = {
+                        "system": system_prompt,
+                        "user": user_prompt,
+                        "phase": state.get("phase", ""),
+                        "provider": active_provider,
+                        "model": active_model,
+                        "retrieved_episode": [item.text for item in episode_selected],
+                        "retrieved_canon": [item.text for item in canon_items],
+                    }
+                response = call_chat(active_provider, active_model, system_prompt, user_prompt)
 
         state["history"].append({"role": "user", "content": prompt, "ts": time.time()})
         state["history"].append({"role": "assistant", "content": response, "ts": time.time()})
@@ -615,9 +686,13 @@ def main() -> None:
         if auto_plan_ready:
             state["plan_generated"] = True
             state["phase"] = "checkin"
+        if state.get("pending_prompt"):
+            state["pending_prompt"] = ""
+            state["pending_mode"] = ""
 
         if state["turn_count"] % int(summary_every) == 0:
             state["summary"] = update_summary(
+                primary_provider,
                 primary_model,
                 state.get("summary", ""),
                 state.get("intake", {}),
@@ -626,6 +701,19 @@ def main() -> None:
 
         save_session(session_path, state)
         rerun_app()
+
+    if dev_mode and st.session_state.get("last_prompt"):
+        with st.expander("Developer mode: prompt + retrieval", expanded=False):
+            payload = st.session_state["last_prompt"]
+            st.markdown("**Phase:** " + payload.get("phase", ""))
+            st.markdown("**System prompt**")
+            st.code(payload.get("system", ""), language="text")
+            st.markdown("**User prompt**")
+            st.code(payload.get("user", ""), language="text")
+            st.markdown("**Retrieved episode principles**")
+            st.write(payload.get("retrieved_episode", []))
+            st.markdown("**Retrieved canon principles**")
+            st.write(payload.get("retrieved_canon", []))
 
 
 if __name__ == "__main__":
